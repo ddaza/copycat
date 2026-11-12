@@ -38,11 +38,7 @@ def atomic_json(path, content):
         stream.flush()
         os.fsync(stream.fileno())
     os.replace(temporary, path)
-    fd = os.open(path.parent, os.O_RDONLY)
-    try:
-        os.fsync(fd)
-    finally:
-        os.close(fd)
+    sync_directory(path.parent)
 
 
 def sync_directory(path):
@@ -64,6 +60,19 @@ def check_record(path, record):
 
 def fingerprint(st):
     return [st.st_size, st.st_mtime_ns]
+
+
+def drop_cache(fd):
+    """Best effort: make verification read storage rather than cached pages.
+
+    Linux evicts clean pages after fsync. macOS has no per-file equivalent, so
+    readback there may be served from memory.
+    """
+    if hasattr(os, "posix_fadvise"):
+        try:
+            os.posix_fadvise(fd, 0, 0, os.POSIX_FADV_DONTNEED)
+        except OSError:
+            pass
 
 
 def digest_prefix(handle, length, conn):
@@ -93,9 +102,29 @@ def worker(conn, operation, args):
                         conn.send(("scan_error", entry.name, str(exc)))
         elif operation == "check":
             check_record(*args)
-        elif operation == "same_device":
+        elif operation == "check_link":
             if os.stat(args[0]).st_dev != os.stat(args[1]).st_dev:
                 raise OSError("Staging and destination folders must be on the same filesystem")
+            # Fail before copying anything if publication by hard link is unsupported.
+            name = f".copycat-link-test-{os.getpid()}-{time.time_ns()}"
+            probe, linked = Path(args[0]) / name, Path(args[1]) / name
+            os.close(os.open(probe, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600))
+            try:
+                os.link(probe, linked, follow_symlinks=False)
+            except OSError as exc:
+                raise OSError(f"Staging/destination filesystem does not support hard links: {exc}") from exc
+            finally:
+                probe.unlink()
+            linked.unlink()
+        elif operation == "prune":
+            # Remove empty folders left behind after partials are published.
+            for path, _, _ in os.walk(args[0], topdown=False):
+                if path != args[0]:
+                    try:
+                        os.rmdir(path)
+                    except OSError:
+                        pass
+                conn.send(("heartbeat",))
         elif operation == "cleanup":
             path, record = args
             try:
@@ -222,6 +251,7 @@ def worker(conn, operation, args):
                     if offset != record["source"][0]:
                         raise OSError("Unexpected source length")
                     if verify:
+                        drop_cache(target.fileno())
                         target.seek(0)
                         checked = digest_prefix(target, offset, conn)
                         if checked.digest() != digest.digest():
@@ -302,6 +332,14 @@ class State:
         self.db.execute("PRAGMA synchronous=FULL")
         self.db.execute("CREATE TABLE IF NOT EXISTS files (path TEXT PRIMARY KEY, record TEXT)")
         self.db.execute("CREATE TABLE IF NOT EXISTS settings (name TEXT PRIMARY KEY, value TEXT)")
+        self.db.execute("CREATE TABLE IF NOT EXISTS empty_dirs (path TEXT PRIMARY KEY)")
+        self.db.commit()
+
+    def empty_dir_done(self, path):
+        return self.db.execute("SELECT 1 FROM empty_dirs WHERE path=?", (path,)).fetchone() is not None
+
+    def mark_empty_dir(self, path):
+        self.db.execute("INSERT OR IGNORE INTO empty_dirs VALUES (?)", (path,))
         self.db.commit()
 
     def bind_staging(self, staging):
@@ -424,8 +462,14 @@ def run(args):
     batch_bytes = int(args.batch_gb * 1_000_000_000) if args.batch_gb else None
     reserve_bytes = int(args.min_free_gb * 1_000_000_000)
 
+    # Cache within one run only: users may move destination folders between runs.
+    known_dirs = set()
+
     def ensure_dir(path):
+        if path in known_dirs:
+            return
         supervised("mkdir", (str(path),), args.timeout, lambda event: None)
+        known_dirs.add(path)
 
     def ensure_parents(root, relative):
         current = root
@@ -442,8 +486,17 @@ def run(args):
                 record.pop("error", None)
                 state.put(relative, record)
 
-        supervised("publish", (str(target), str(destination / relative), record),
-                   args.timeout, event)
+        try:
+            supervised("publish", (str(target), str(destination / relative), record),
+                       args.timeout, event)
+        except OSError as exc:
+            if record["status"] != "done":
+                raise
+            # The completed file is safely published; a later run removes the staging link.
+            print(f"WARNING {relative}: published, but staging cleanup failed: {exc}", flush=True)
+        else:
+            record["staging_clean"] = True
+            state.put(relative, record)
         print(f"READY {relative}", flush=True)
 
     def copy_file(relative, signature):
@@ -457,8 +510,14 @@ def run(args):
             print(f"FAILED {relative}: {record['error']}", flush=True)
             return
         if record["status"] == "done":
-            if record.get("layout") == "separate":
-                supervised("cleanup", (str(target), record), args.timeout, lambda event: None)
+            # Clean up once, rather than starting a worker for every success on every run.
+            if record.get("layout") == "separate" and not record.get("staging_clean"):
+                try:
+                    supervised("cleanup", (str(target), record), args.timeout, lambda event: None)
+                    record["staging_clean"] = True
+                    state.put(relative, record)
+                except OSError as exc:
+                    print(f"WARNING {relative}: staging cleanup failed: {exc}", flush=True)
             if not args.check_completed:
                 print(f"ALREADY COPIED {relative} (saved success; destination may have been moved)",
                       flush=True)
@@ -480,24 +539,26 @@ def run(args):
             try:
                 publish(relative, record, target)
             except NoSpaceError as exc:
-                if record["status"] == "done":
-                    raise
                 record.update(status="ready", error=str(exc))
                 state.put(relative, record)
                 raise StopRun("free_space_limit") from exc
             except OSError as exc:
-                if record["status"] == "done":
-                    raise
                 record.update(status="conflict", error=str(exc))
                 state.put(relative, record)
                 print(f"PUBLISH FAILED {relative}: {exc}", flush=True)
             return
-        ensure_parents(staging, relative)
         # Detect unrelated destination files before reading the source contents.
         if os.path.lexists(destination / relative):
             record.update(status="conflict", error="Destination already exists; refusing to overwrite")
             state.put(relative, record)
             print(f"CONFLICT {relative}: {record['error']}", flush=True)
+            return
+        try:
+            ensure_parents(staging, relative)
+        except OSError as exc:
+            record.update(status="failed", error=f"Cannot create staging folder: {exc}")
+            state.put(relative, record)
+            print(f"FAILED {relative}: {record['error']}", flush=True)
             return
         for attempt in range(args.attempts):
             remaining = None if batch_bytes is None else batch_bytes - bytes_copied
@@ -535,16 +596,12 @@ def run(args):
                 publish(relative, record, target)
                 return
             except NoSpaceError as exc:
-                if record["status"] == "done":
-                    raise
                 record.update(status="ready" if record.get("sha256") else
                               ("partial" if record.get("identity") else "pending"),
                               error=str(exc))
                 state.put(relative, record)
                 raise StopRun("free_space_limit") from exc
             except OSError as exc:
-                if record["status"] == "done":
-                    raise
                 record.update(status="conflict" if "FileExistsError" in str(exc) else "failed",
                               error=str(exc))
                 state.put(relative, record)
@@ -556,7 +613,8 @@ def run(args):
         state.export_progress(force=True)
         ensure_dir(destination)
         ensure_dir(staging)
-        supervised("same_device", (str(destination), str(staging)), args.timeout,
+        # Also verifies hard-link support, before any source data is read.
+        supervised("check_link", (str(staging), str(destination)), args.timeout,
                    lambda event: None)
         # Upgrade old checkpoints before exposing the destination as completed-only.
         for saved in state.records():
@@ -584,11 +642,14 @@ def run(args):
             relative_dir = stack.pop()
             entries = []
             scan_key = f"\0scan:{relative_dir}"
+            scan_complete = True
 
             def scan_event(event):
+                nonlocal scan_complete
                 if event[0] == "entry":
                     entries.append(event[1:])
                 elif event[0] == "scan_error":
+                    scan_complete = False
                     key = str(relative_dir / event[1])
                     state.put(f"\0stat:{key}", {"status": "failed", "error": event[2]})
                     print(f"STAT FAILED {key}: {event[2]}", flush=True)
@@ -598,22 +659,30 @@ def run(args):
                 # A successful later scan clears earlier directory errors.
                 state.delete(scan_key)
             except OSError as exc:
+                scan_complete = False
                 state.put(scan_key, {"status": "failed", "error": str(exc)})
                 print(f"SCAN FAILED {relative_dir}: {exc}", flush=True)
                 # Entries already received are still usable.
+            # Destination folders are otherwise created only when a completed file is
+            # published. Recreate genuinely empty folders once, so offloading stays simple.
+            dir_key = str(relative_dir)
+            if (scan_complete and not entries and relative_dir != Path(".")
+                    and not state.empty_dir_done(dir_key)):
+                try:
+                    ensure_parents(destination, str(relative_dir / "placeholder"))
+                    state.mark_empty_dir(dir_key)
+                    state.delete(f"\0mkdir:{dir_key}")
+                except OSError as exc:
+                    state.put(f"\0mkdir:{dir_key}", {"status": "failed", "error": str(exc)})
+                    print(f"DIRECTORY FAILED {relative_dir}: {exc}", flush=True)
             for name, mode, signature in entries:
                 relative = relative_dir / name
                 key = str(relative)
                 state.delete(f"\0stat:{key}")
                 if stat.S_ISDIR(mode):
-                    try:
-                        ensure_parents(destination, str(relative / "placeholder"))
-                        ensure_parents(staging, str(relative / "placeholder"))
-                        stack.append(relative)
-                        state.delete(f"\0mkdir:{key}")
-                    except OSError as exc:
-                        state.put(f"\0mkdir:{key}", {"status": "failed", "error": str(exc)})
-                        print(f"DIRECTORY FAILED {relative}: {exc}", flush=True)
+                    # Folder creation errors from older versions are retried when scanned.
+                    state.delete(f"\0mkdir:{key}")
+                    stack.append(relative)
                 elif stat.S_ISREG(mode):
                     copy_file(key, signature)
                 else:
@@ -634,6 +703,11 @@ def run(args):
         try:
             counts = state.report(source, destination, interrupted, fatal_error,
                                   stop_reason, bytes_copied)
+            if fatal_error is None:
+                try:
+                    supervised("prune", (str(staging),), args.timeout, lambda event: None)
+                except OSError as exc:
+                    print(f"WARNING: could not prune empty staging folders: {exc}", flush=True)
         finally:
             state.db.close()
             state.lock.release()
