@@ -33,6 +33,21 @@ class CopycatTests(unittest.TestCase):
                 "--staging-dir", str(self.staging),
                 "--checkpoint-mib", "1", "--min-free-gb", "0", *extra]
 
+    def run_in_process(self, *extra):
+        """Run in this process so tests can count supervised worker operations."""
+        args = copycat.parse_args(self.command(*extra)[2:])
+        operations = []
+        original = copycat.supervised
+
+        def counting(operation, *rest):
+            operations.append(operation)
+            return original(operation, *rest)
+
+        output = io.StringIO()
+        with patch.object(copycat, "supervised", counting), contextlib.redirect_stdout(output):
+            code = copycat.run(args)
+        return code, operations, output.getvalue()
+
     def run_copy(self, *extra, expected=0):
         result = subprocess.run(self.command(*extra), capture_output=True, text=True, timeout=30)
         self.assertEqual(result.returncode, expected, result.stdout + result.stderr)
@@ -481,6 +496,77 @@ class CopycatTests(unittest.TestCase):
         self.assertEqual((default_staging / "file").stat().st_size, 1_000_000)
         self.assertEqual(list(self.destination.iterdir()), [])
 
+    def test_completed_files_do_not_start_workers_on_later_runs(self):
+        for number in range(3):
+            (self.source / f"file{number}").write_text(str(number))
+        self.run_copy()
+        code, operations, output = self.run_in_process()
+        self.assertEqual(code, 0)
+        self.assertNotIn("cleanup", operations)
+        self.assertNotIn("copy", operations)
+        self.assertEqual(output.count("ALREADY COPIED"), 3)
+
+    def test_folders_are_created_once_per_run(self):
+        nested = self.source / "a" / "b" / "c"
+        nested.mkdir(parents=True)
+        for number in range(5):
+            (nested / f"file{number}").write_text(str(number))
+        code, operations, _ = self.run_in_process()
+        self.assertEqual(code, 0)
+        # Destination and staging roots, plus a, a/b and a/b/c under each.
+        self.assertEqual(operations.count("mkdir"), 8)
+
+    def test_incomplete_files_do_not_create_destination_folders(self):
+        nested = self.source / "a" / "b"
+        nested.mkdir(parents=True)
+        (nested / "large").write_bytes(b"x" * 2_000_000)
+        self.run_copy("--batch-gb", "0.001")
+        self.assertEqual(list(self.destination.iterdir()), [])
+        self.assertEqual((self.staging / "a" / "b" / "large").stat().st_size, 1_000_000)
+        self.run_copy()
+        self.assertEqual((self.destination / "a" / "b" / "large").stat().st_size, 2_000_000)
+        # Published partials do not leave empty staging folders behind.
+        self.assertEqual(list(self.staging.iterdir()), [])
+
+    def test_empty_folders_are_not_recreated_after_offloading(self):
+        (self.source / "empty" / "nested-empty").mkdir(parents=True)
+        self.run_copy()
+        self.assertTrue((self.destination / "empty" / "nested-empty").is_dir())
+        shutil.rmtree(self.destination / "empty")
+        self.run_copy()
+        self.assertFalse((self.destination / "empty").exists())
+
+    def test_unrecognized_staging_file_is_kept_and_run_continues(self):
+        target = self.seed_ready(b"durable success", status="done", linked=True)
+        target.unlink()
+        target.write_text("not copycat's file")
+        (self.source / "other").write_text("other")
+        result = self.run_copy()
+        self.assertIn("staging cleanup failed", result.stdout)
+        self.assertEqual(target.read_text(), "not copycat's file")
+        self.assertEqual((self.destination / "other").read_text(), "other")
+
+    def test_missing_hard_link_support_fails_before_copying(self):
+        self.staging.mkdir()
+        self.destination.mkdir()
+        messages = []
+
+        class Connection:
+            def send(self, event):
+                messages.append(event)
+
+            def close(self):
+                pass
+
+        unsupported = PermissionError(1, "Operation not permitted")
+        with patch.object(copycat.signal, "signal"), patch.object(copycat.os, "link",
+                                                                  side_effect=unsupported):
+            copycat.worker(Connection(), "check_link", (str(self.staging), str(self.destination)))
+        self.assertTrue(any(event[0] == "error" and "hard links" in event[1]
+                            for event in messages))
+        self.assertEqual(list(self.staging.iterdir()), [])
+        self.assertEqual(list(self.destination.iterdir()), [])
+
     def exit_signal_and_resume(self, sig):
         source_file = self.source / "large"
         with source_file.open("wb") as stream:
@@ -517,7 +603,9 @@ class CopycatTests(unittest.TestCase):
                                    stderr=subprocess.PIPE, text=True)
         try:
             for line in process.stdout:
-                if line.startswith("COPY large"):
+                # Wait for a checkpoint, as the other signal tests do. Sending exactly
+                # as the worker spawns was intermittently lost on CI (Python 3.10/macOS).
+                if "large: 1,048,576/" in line:
                     process.send_signal(signal.SIGINT)
                     break
             stdout, stderr = process.communicate(timeout=10)

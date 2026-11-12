@@ -58,6 +58,11 @@ Destination and staging path components cannot be symlinks.
 Publication uses an atomic, no-overwrite hard link followed by removal of the staging
 entry after the success is durably saved. This does not duplicate file contents or
 require space for a second copy. Offload files only after the run exits.
+Hard-link support is checked at startup, before anything is read from the source.
+
+Destination folders are created only when a completed file is published, so incomplete
+work never leaves empty folder trees there. Empty source folders are recreated once and
+are not recreated after you offload them. Empty staging folders are removed at exit.
 
 | Setting                   | Meaning                                                                                                              |
 | ------------------------- | -------------------------------------------------------------------------------------------------------------------- |
@@ -209,10 +214,13 @@ Exit codes: `0` normal completion or batch/space exit without saved failures/con
 - Partial files use their relative source paths **inside staging**, never destination.
   Failed or interrupted verification does not publish a file. Do not offload staging.
   With `verify: false`, publication skips readback verification; leave it enabled.
+  On Linux, cached pages are dropped before readback so it reads from storage. macOS has
+  no per-file equivalent, so readback there may be served from memory; it still catches
+  copy-path mistakes, but not every disk-level write fault.
 - In-progress source and destination files must not be modified by other applications.
   Source identity uses size/mtime, not a live-filesystem snapshot. Changed source files are
   reported rather than silently replacing archived results.
-- Hidden files and empty directories are included. Symlinks, devices, sockets and other
+- Hidden files and empty directories are included (empty directories once per job). Symlinks, devices, sockets and other
   special files are skipped and reported.
 - This preserves file contents and file modification times, **not** Mac resource forks,
   extended attributes, Finder metadata, ACLs, ownership, directory timestamps, or hard-link
