@@ -603,7 +603,9 @@ class CopycatTests(unittest.TestCase):
                                    stderr=subprocess.PIPE, text=True)
         try:
             for line in process.stdout:
-                if line.startswith("COPY large"):
+                # Wait for a checkpoint, as the other signal tests do. Sending exactly
+                # as the worker spawns was intermittently lost on CI (Python 3.10/macOS).
+                if "large: 1,048,576/" in line:
                     process.send_signal(signal.SIGINT)
                     break
             stdout, stderr = process.communicate(timeout=10)
