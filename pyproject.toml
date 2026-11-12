@@ -1,0 +1,8 @@
+[project]
+name = "copycat"
+version = "0.1.0"
+description = "Checkpointed file recovery with separate incomplete-file staging"
+requires-python = ">=3.10"
+dependencies = [
+    "filelock>=4.1.0",
+]

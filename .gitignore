@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+state/
+staging/
+.venv/
+.DS_Store
+config.json
+/recovered/
+*.staging/
+*.sqlite3
+*.sqlite3-*
+success.json
+fails.json
+latest-report.json
+report-*.json
+.env
+.env.*

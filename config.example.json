@@ -1,0 +1,15 @@
+{
+  "source": null,
+  "destination": "./recovered",
+  "staging_dir": "./staging",
+  "state_dir": "./state",
+  "checkpoint_mib": 16,
+  "timeout_seconds": 60,
+  "retries": 1,
+  "verify": true,
+  "retry_failed": false,
+  "check_completed": false,
+  "batch_gb": 100,
+  "min_free_gb": 5,
+  "report_interval_seconds": 30
+}
