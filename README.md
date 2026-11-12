@@ -229,12 +229,11 @@ Exit codes: `0` normal completion or batch/space exit without saved failures/con
 - This is not deleted-file recovery or a disk image. If the old drive clicks/disconnects or
   repeatedly produces hardware errors, consider **GNU ddrescue** or professional recovery.
 
-## Privacy
+## Config
 
-Only `config.example.json` belongs in version control. Local configuration, default
-staging/recovered folders, checkpoints, and reports are ignored. Reports and terminal
-output can contain absolute paths and source filenames; review them before sharing.
-If you choose other local output folders, add them to `.gitignore` too.
+Look at `config.example.json` for local configuration, defaults,
+staging/recovered folders, checkpoints, and reports.
+Create a `config.json` with your values.
 
 ## Tests
 
